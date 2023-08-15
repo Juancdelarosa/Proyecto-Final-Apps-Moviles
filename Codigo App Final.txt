@@ -1,0 +1,411 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart';
+import 'package:camera/camera.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:path_provider/path_provider.dart';
+import 'dart:io';
+import 'package:http/http.dart' as http;
+import 'dart:convert';
+import 'package:geolocator/geolocator.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  cameras = await availableCameras();
+  runApp(MyApp());
+}
+
+class MyApp extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'Interactive Turism',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+      ),
+      home: MyHomePage(),
+    );
+  }
+}
+
+List<CameraDescription> cameras = [];
+
+class Place {
+  final String name;
+  final double latitude;
+  final double longitude;
+
+  Place(this.name, this.latitude, this.longitude);
+}
+
+class _MyHomePageState extends State<MyHomePage> {
+  final FirebaseAuth _auth = FirebaseAuth.instance;
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  User? _user;
+  late LatLng _currentLocation;
+  late MapController _mapController;
+  late List<Marker> _markers = [];
+  late CameraController _cameraController;
+  late bool _isCameraInitialized;
+  late SharedPreferences _preferences;
+  late TextEditingController _attractionController;
+
+  @override
+  void initState() {
+    super.initState();
+    _initUser();
+    _mapController = MapController();
+    _initLocation();
+    _initMap();
+    _initCamera();
+    _initSharedPreferences();
+    _attractionController = TextEditingController();
+  }
+
+  Future<void> _initUser() async {
+    _user = _auth.currentUser;
+    if (_user == null) {
+      UserCredential authResult = await _auth.signInAnonymously();
+      _user = authResult.user;
+    }
+  }
+
+  Future<void> _initLocation() async {
+    _currentLocation = await _getCurrentLocation();
+  }
+
+  Future<LatLng> _getCurrentLocation() async {
+    Position position = await Geolocator.getCurrentPosition(
+      desiredAccuracy: LocationAccuracy.best,
+    );
+    return LatLng(position.latitude, position.longitude);
+  }
+
+  void _initMap() {
+    _markers.add(
+      Marker(
+        width: 80.0,
+        height: 80.0,
+        point: _currentLocation,
+        builder: (ctx) => Icon(
+          Icons.location_pin,
+          color: Colors.red,
+        ),
+      ),
+    );
+
+    _fetchTouristPlaces();
+  }
+
+  Future<void> _fetchTouristPlaces() async {
+    final List<Map<String, dynamic>> placesData = [
+      {'name': 'Museo de Historia', 'latitude': 40.7128, 'longitude': -74.0060},
+      {'name': 'Parque Central', 'latitude': 40.7123, 'longitude': -74.0063},
+      {'name': 'Restaurante Sabores', 'latitude': 40.7135, 'longitude': -74.0055},
+    ];
+
+    setState(() {
+      _markers = List<Marker>.from(placesData.map((placeData) {
+        return Marker(
+          width: 80.0,
+          height: 80.0,
+          point: LatLng(placeData['latitude'], placeData['longitude']),
+          builder: (ctx) => Icon(
+            Icons.place,
+            color: Colors.blue,
+          ),
+        );
+      }));
+    });
+  }
+
+  Future<void> _initCamera() async {
+    final cameras = await availableCameras();
+    _cameraController = CameraController(cameras[0], ResolutionPreset.medium);
+    await _cameraController.initialize();
+    _isCameraInitialized = true;
+  }
+
+  Future<void> _takePicture(int index) async {
+    final Directory appDir = await getApplicationDocumentsDirectory();
+    final String picturePath = "${appDir.path}/picture_${DateTime.now().millisecondsSinceEpoch}.jpg";
+    await _cameraController.takePicture(picturePath);
+
+    final savedPlaces = _getSavedPlacesFromPreferences();
+    final place = _markers[index].point;
+    final pictureData = {
+      'path': picturePath,
+      'latitude': place.latitude,
+      'longitude': place.longitude,
+    };
+
+    savedPlaces.add(json.encode(pictureData));
+    await _preferences.setStringList('saved_places', savedPlaces);
+
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('Imagen capturada y guardada para este lugar.'),
+    ));
+  }
+
+  Future<void> _initSharedPreferences() async {
+    _preferences = await SharedPreferences.getInstance();
+  }
+
+  Future<void> _planRoute(int startIndex, int endIndex) async {
+    final start = _markers[startIndex].point;
+    final end = _markers[endIndex].point;
+
+    final response = await http.get(Uri.parse(
+        'https://api.openrouteservice.org/v2/directions/driving-car?api_key=YOUR_API_KEY&start=${start.longitude},${start.latitude}&end=${end.longitude},${end.latitude}'));
+
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      final duration = (data['features'][0]['properties']['segments'][0]['duration'] / 60).toStringAsFixed(1);
+
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Tiempo estimado de llegada: $duration minutos.'),
+      ));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('No se pudo planificar la ruta.'),
+      ));
+    }
+  }
+
+  Future<void> _fetchWeather(int index) async {
+    final place = _markers[index].point;
+    final response = await http.get(Uri.parse(
+        'https://api.open-meteo.com/v1/forecast?latitude=${place.latitude}&longitude=${place.longitude}&hourly=temperature_2m,weathercode&current_weather=true'));
+
+    if (response.statusCode == 200) {
+      final data = json.decode(response.body);
+      final temperature = data['hourly']['temperature_2m'][0];
+      final weatherCode = data['hourly']['weathercode'][0];
+
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('Clima actual: Temperatura: $temperature°C, Código de clima: $weatherCode.'),
+      ));
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+        content: Text('No se pudo obtener el clima.'),
+      ));
+    }
+  }
+
+  Future<void> _addAttraction() async {
+    final attractionName = _attractionController.text;
+    if (attractionName.isNotEmpty) {
+      await _firestore.collection('attractions').add({'name': attractionName});
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Atracción agregada: $attractionName')),
+      );
+      _attractionController.clear();
+    }
+  }
+
+  List<Map<String, dynamic>> _getSavedPlacesFromPreferences() {
+    final savedPlaces = _preferences.getStringList('saved_places') ?? [];
+    return savedPlaces.map((placeJson) => json.decode(placeJson)).toList();
+  }
+
+  Future<void> _savePlaceToPreferences(int index) async {
+    final savedPlaces = _getSavedPlacesFromPreferences();
+    final place = _markers[index].point;
+    final placeData = {
+      'latitude': place.latitude,
+      'longitude': place.longitude,
+    };
+
+    savedPlaces.add(json.encode(placeData));
+    await _preferences.setStringList('saved_places', savedPlaces);
+
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text('Lugar guardado para acceso offline.'),
+    ));
+  }
+
+  @override
+  void dispose() {
+    _cameraController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text('Interactive Turism'),
+      ),
+      body: Column(
+        children: [
+          Expanded(
+            child: FlutterMap(
+              options: MapOptions(
+                center: _currentLocation,
+                zoom: 15.0,
+                controller: _mapController,
+              ),
+              layers: [
+                TileLayerOptions(
+                  urlTemplate: "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                  subdomains: ['a', 'b', 'c'],
+                ),
+                MarkerLayerOptions(markers: _markers),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ListView.builder(
+              itemCount: _markers.length,
+              itemBuilder: (context, index) {
+                final marker = _markers[index];
+                final savedPlaces = _getSavedPlacesFromPreferences();
+                final isPlaceSaved = savedPlaces.any((place) =>
+                    place['latitude'] == marker.point.latitude &&
+                    place['longitude'] == marker.point.longitude);
+
+                return ListTile(
+                  title: Text(marker.point.toString()),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: Icon(isPlaceSaved
+                            ? Icons.bookmark
+                            : Icons.bookmark_border),
+                        onPressed: () {
+                          if (isPlaceSaved) {
+                            // Remove from saved places
+                            // TODO: Implement this logic
+                          } else {
+                            _savePlaceToPreferences(index);
+                          }
+                        },
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.camera_alt),
+                        onPressed: () {
+                          if (_isCameraInitialized) {
+                            _takePicture(index);
+                          }
+                        },
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.directions),
+                        onPressed: () {
+                          if (_markers.length >= 2) {
+                            _planRoute(0, index); // Planificar ruta desde el primer marcador
+                          }
+                        },
+                      ),
+                      IconButton(
+                        icon: Icon(Icons.cloud),
+                        onPressed: () {
+                          _fetchWeather(index);
+                        },
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Usuarios Registrados:',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              StreamBuilder<QuerySnapshot>(
+                stream: _firestore.collection('users').snapshots(),
+                builder: (context, snapshot) {
+                  if (snapshot.hasData) {
+                    final users = snapshot.data!.docs;
+                    return Column(
+                      children: users.map((user) {
+                        final userData = user.data() as Map<String, dynamic>;
+                        return ListTile(
+                          title: Text(userData['email']),
+                        );
+                      }).toList(),
+                    );
+                  }
+                  return CircularProgressIndicator();
+                },
+              ),
+              SizedBox(height: 20),
+              Text(
+                'Definir Atracciones Turísticas:',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+              TextField(
+                controller: _attractionController,
+                decoration: InputDecoration(
+                  labelText: 'Nombre de la Atracción',
+                  suffixIcon: IconButton(
+                    icon: Icon(Icons.add),
+                    onPressed: _addAttraction,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          Container(
+            padding: EdgeInsets.all(20.0),
+            color: Colors.blueGrey,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Text(
+                  '¡Descubre el Mundo con Interactive Turism!',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 24.0,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                SizedBox(height: 10.0),
+                Text(
+                  'Explora lugares increíbles, captura momentos, planifica rutas y más.',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 16.0,
+                  ),
+                  textAlign: TextAlign.center,
+                ),
+                SizedBox(height: 20.0),
+                ElevatedButton(
+                  onPressed: () {},
+                  child: Text(
+                    '¡Empieza tu Aventura Ahora!',
+                    style: TextStyle(
+                      fontSize: 18.0,
+                    ),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    primary: Colors.green,
+                    padding: EdgeInsets.symmetric(horizontal: 30.0, vertical: 15.0),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class MyHomePage extends StatefulWidget {
+  @override
+  _MyHomePageState createState() => _MyHomePageState();
+}
+
+class AdminScreen extends StatefulWidget {
+  @override
+  _AdminScreenState createState() => _AdminScreenState();
+}
